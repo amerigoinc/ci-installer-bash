@@ -1,0 +1,430 @@
+#!/bin/bash
+# PRODUCTION CI PACKAGE MANAGER - NO BULLSHIT
+set -e
+
+echo "🔥 PRODUCTION CI PACKAGE MANAGER INSTALLATION"
+echo "============================================"
+
+# Create directory structure
+mkdir -p ~/.ci/{packages,bin,apps,config,logs}
+mkdir -p ~/.local/bin
+
+# Create the ACTUAL WORKING CI manager
+cat > ~/.ci/ci-manager << 'EOF'
+#!/bin/bash
+CI_DIR="$HOME/.ci"
+PACKAGES_DIR="$CI_DIR/packages"
+BIN_DIR="$CI_DIR/bin"
+APPS_DIR="$CI_DIR/apps"
+CONFIG_FILE="$CI_DIR/config/packages.json"
+ORG="amerigoinc"
+BASE_URL="https://github.com/$ORG"
+
+# Initialize config
+init_config() {
+    if [ ! -f "$CONFIG_FILE" ]; then
+        mkdir -p "$(dirname "$CONFIG_FILE")"
+        echo '{"installed_packages":{}}' > "$CONFIG_FILE"
+    fi
+}
+
+# Check if package exists in org
+package_exists() {
+    local pkg="$1"
+    git ls-remote "$BASE_URL/$pkg.git" &>/dev/null
+    return $?
+}
+
+# Install package from amerigoinc
+install_package() {
+    local pkg="$1"
+    
+    if [ -z "$pkg" ]; then
+        echo "❌ Usage: ci install <package-name>"
+        echo "💡 Try: ci search (to find packages)"
+        return 1
+    fi
+    
+    echo "🔧 Installing $pkg from $ORG..."
+    
+    # Check if package exists
+    if ! package_exists "$pkg"; then
+        echo "❌ Package '$pkg' not found in $ORG"
+        echo "🌐 Check: $BASE_URL"
+        return 1
+    fi
+    
+    local pkg_dir="$PACKAGES_DIR/$pkg"
+    local repo_url="$BASE_URL/$pkg.git"
+    
+    # Clone the package
+    echo "📥 Cloning repository..."
+    if git clone "$repo_url" "$pkg_dir" 2>/dev/null; then
+        echo "✅ Repository cloned"
+    else
+        echo "❌ Failed to clone repository"
+        return 1
+    fi
+    
+    # Check for spec.ci
+    if [ ! -f "$pkg_dir/spec.ci" ]; then
+        echo "❌ Package '$pkg' is not a valid CI package (missing spec.ci)"
+        rm -rf "$pkg_dir"
+        return 1
+    fi
+    
+    # Parse spec.ci
+    local app_name=$(grep -o '"app_name":"[^"]*"' "$pkg_dir/spec.ci" | head -1 | cut -d'"' -f4)
+    local main_file=$(grep -o '"main_file":"[^"]*"' "$pkg_dir/spec.ci" | head -1 | cut -d'"' -f4)
+    
+    if [ -z "$app_name" ]; then
+        app_name="$pkg"
+    fi
+    
+    # Check if main file exists
+    if [ ! -f "$pkg_dir/$main_file" ]; then
+        echo "❌ Main file '$main_file' not found in package"
+        rm -rf "$pkg_dir"
+        return 1
+    fi
+    
+    # Make main file executable
+    chmod +x "$pkg_dir/$main_file"
+    
+    # Create launcher
+    local launcher_file="$APPS_DIR/$app_name"
+    cat > "$launcher_file" << LAUNCHER
+#!/bin/bash
+cd "$pkg_dir"
+exec "./$main_file" "\$@"
+LAUNCHER
+    
+    chmod +x "$launcher_file"
+    ln -sf "$launcher_file" "$BIN_DIR/$app_name"
+    
+    # Register in config
+    init_config
+    local installed_packages=$(cat "$CONFIG_FILE")
+    installed_packages=$(echo "$installed_packages" | jq --arg pkg "$pkg" --arg app "$app_name" --arg url "$repo_url" '.installed_packages[$pkg] = {"app_name": $app, "url": $url, "installed": "'$(date -Iseconds)'"}')
+    echo "$installed_packages" > "$CONFIG_FILE"
+    
+    echo "🎉 $pkg installed successfully!"
+    echo "🚀 Usage: $app_name"
+    echo "💡 Try: $app_name --help"
+}
+
+# Remove package
+remove_package() {
+    local pkg="$1"
+    
+    if [ -z "$pkg" ]; then
+        echo "❌ Usage: ci remove <package-name>"
+        return 1
+    fi
+    
+    local pkg_dir="$PACKAGES_DIR/$pkg"
+    
+    if [ ! -d "$pkg_dir" ]; then
+        echo "❌ Package '$pkg' not found"
+        return 1
+    fi
+    
+    # Get app name from config or spec.ci
+    local app_name="$pkg"
+    if [ -f "$CONFIG_FILE" ]; then
+        local config_app=$(jq -r ".installed_packages.\"$pkg\".app_name" "$CONFIG_FILE" 2>/dev/null)
+        if [ "$config_app" != "null" ] && [ -n "$config_app" ]; then
+            app_name="$config_app"
+        fi
+    fi
+    
+    # Remove files
+    rm -rf "$pkg_dir"
+    rm -f "$APPS_DIR/$app_name"
+    rm -f "$BIN_DIR/$app_name"
+    
+    # Remove from config
+    if [ -f "$CONFIG_FILE" ]; then
+        local installed_packages=$(cat "$CONFIG_FILE")
+        installed_packages=$(echo "$installed_packages" | jq "del(.installed_packages[\"$pkg\"])")
+        echo "$installed_packages" > "$CONFIG_FILE"
+    fi
+    
+    echo "✅ $pkg removed successfully"
+}
+
+# List installed packages
+list_packages() {
+    echo "📦 INSTALLED PACKAGES:"
+    echo "===================="
+    
+    if [ ! -f "$CONFIG_FILE" ] || [ "$(jq -r '.installed_packages | length' "$CONFIG_FILE" 2>/dev/null)" = "0" ]; then
+        echo "No packages installed"
+        echo ""
+        echo "Get started:"
+        echo "  ci install <package-name>"
+        echo "  ci search"
+        return
+    fi
+    
+    jq -r '.installed_packages | to_entries[] | "🛠️  " + .value.app_name + "\n   📦 Package: " + .key + "\n   🔗 " + .value.url + "\n"' "$CONFIG_FILE"
+}
+
+# Search for packages
+search_packages() {
+    local query="$1"
+    
+    echo "🔍 SEARCH PACKAGES in $ORG"
+    echo "=========================="
+    
+    if [ "$query" = "all" ] || [ -z "$query" ]; then
+        echo "Since we can't automatically scan GitHub org, here's how to find packages:"
+        echo ""
+        echo "1. Visit: $BASE_URL"
+        echo "2. Look for repositories with 'spec.ci' files"
+        echo "3. Install with: ci install <repo-name>"
+        echo ""
+        echo "Common naming patterns to try:"
+        echo "  • file-tools, text-utils, image-tools"
+        echo "  • network-scanner, security-tools"
+        echo "  • dev-utils, sys-tools, web-tools"
+        echo ""
+        echo "If a package exists and has spec.ci, you can install it!"
+        return
+    fi
+    
+    echo "Searching for: $query"
+    echo ""
+    echo "Try: ci install $query"
+    echo "Or visit: $BASE_URL?q=$query"
+}
+
+# Show package info
+package_info() {
+    local pkg="$1"
+    
+    if [ -z "$pkg" ]; then
+        echo "❌ Usage: ci info <package-name>"
+        return 1
+    fi
+    
+    local pkg_dir="$PACKAGES_DIR/$pkg"
+    
+    if [ ! -d "$pkg_dir" ]; then
+        echo "❌ Package '$pkg' not found"
+        return 1
+    fi
+    
+    echo "📋 PACKAGE INFO: $pkg"
+    echo "=================="
+    echo "Location: $pkg_dir"
+    
+    if [ -f "$pkg_dir/spec.ci" ]; then
+        echo ""
+        echo "Specification:"
+        cat "$pkg_dir/spec.ci"
+    fi
+    
+    if [ -f "$pkg_dir/README.md" ]; then
+        echo ""
+        echo "README:"
+        head -10 "$pkg_dir/README.md"
+    fi
+}
+
+# Update package
+update_package() {
+    local pkg="$1"
+    
+    if [ -z "$pkg" ]; then
+        echo "❌ Usage: ci update <package-name>"
+        return 1
+    fi
+    
+    local pkg_dir="$PACKAGES_DIR/$pkg"
+    
+    if [ ! -d "$pkg_dir" ]; then
+        echo "❌ Package '$pkg' not found"
+        return 1
+    fi
+    
+    echo "🔄 Updating $pkg..."
+    
+    # Get current app name before update
+    local current_app="$pkg"
+    if [ -f "$CONFIG_FILE" ]; then
+        local config_app=$(jq -r ".installed_packages.\"$pkg\".app_name" "$CONFIG_FILE" 2>/dev/null)
+        if [ "$config_app" != "null" ] && [ -n "$config_app" ]; then
+            current_app="$config_app"
+        fi    fi
+    
+    # Remove old launcher
+    rm -f "$APPS_DIR/$current_app"
+    rm -f "$BIN_DIR/$current_app"
+    
+    # Update via git pull
+    if (cd "$pkg_dir" && git pull --ff-only 2>/dev/null); then
+        echo "✅ Repository updated"
+        
+        # Re-create launcher
+        local app_name=$(grep -o '"app_name":"[^"]*"' "$pkg_dir/spec.ci" | head -1 | cut -d'"' -f4)
+        local main_file=$(grep -o '"main_file":"[^"]*"' "$pkg_dir/spec.ci" | head -1 | cut -d'"' -f4)
+        
+        if [ -z "$app_name" ]; then
+            app_name="$pkg"
+        fi
+        
+        if [ -f "$pkg_dir/$main_file" ]; then
+            chmod +x "$pkg_dir/$main_file"
+            
+            # Create new launcher
+            local launcher_file="$APPS_DIR/$app_name"
+            cat > "$launcher_file" << LAUNCHER
+#!/bin/bash
+cd "$pkg_dir"
+exec "./$main_file" "\$@"
+LAUNCHER
+            
+            chmod +x "$launcher_file"
+            ln -sf "$launcher_file" "$BIN_DIR/$app_name"
+            
+            # Update config
+            init_config
+            local installed_packages=$(cat "$CONFIG_FILE")
+            installed_packages=$(echo "$installed_packages" | jq --arg pkg "$pkg" --arg app "$app_name" '.installed_packages[$pkg].app_name = $app')
+            echo "$installed_packages" > "$CONFIG_FILE"
+            
+            echo "🎉 $pkg updated successfully!"
+            echo "🚀 Usage: $app_name"
+        else
+            echo "❌ Main file '$main_file' not found after update"
+            return 1
+        fi
+    else
+        echo "❌ Failed to update $pkg"
+        return 1
+    fi
+}
+
+# Show system status
+system_status() {
+    echo "🔧 CI PACKAGE MANAGER STATUS"
+    echo "==========================="
+    echo "Version: Production"
+    echo "Organization: $ORG"
+    echo "Installation: $CI_DIR"
+    echo ""
+    
+    local pkg_count=0
+    if [ -f "$CONFIG_FILE" ]; then
+        pkg_count=$(jq -r '.installed_packages | length' "$CONFIG_FILE" 2>/dev/null || echo "0")
+    fi
+    
+    local app_count=0
+    if [ -d "$BIN_DIR" ]; then
+        app_count=$(find "$BIN_DIR" -type l | wc -l)
+    fi
+    
+    echo "📦 Packages: $pkg_count"
+    echo "🚀 Commands: $app_count"
+    echo ""
+    echo "💡 Type any package name to run it!"
+}
+
+# Main command handler
+case "$1" in
+    install)
+        install_package "$2"
+        ;;
+    remove|uninstall)
+        remove_package "$2"
+        ;;
+    update|upgrade)
+        update_package "$2"
+        ;;
+    list|ls)
+        list_packages
+        ;;
+    search)
+        search_packages "$2"
+        ;;
+    info|show)
+        package_info "$2"
+        ;;
+    status|stat)
+        system_status
+        ;;
+    help|--help|-h)
+        echo "🚀 PRODUCTION CI PACKAGE MANAGER"
+        echo "Usage: ci <command> [package]"
+        echo ""
+        echo "Commands:"
+        echo "  install <package>    Install package from $ORG"
+        echo "  remove <package>     Remove package"
+        echo "  update <package>     Update package"
+        echo "  list                List installed packages"
+        echo "  search [query]      Search for packages"
+        echo "  info <package>      Show package information"
+        echo "  status              System status"
+        echo "  help                This help"
+        echo ""
+        echo "Examples:"
+        echo "  ci install file-tools"
+        echo "  ci list"
+        echo "  ci search all"
+        echo "  file-tools          # Run installed tool"
+        echo ""
+        echo "🌐 Packages from: $BASE_URL"
+        ;;
+    *)
+        echo "❌ Unknown command: $1"
+        echo "💡 Use: ci help"
+        ;;
+esac
+EOF
+
+# Make executable
+chmod +x ~/.ci/ci-manager
+
+# Install to system
+ln -sf ~/.ci/ci-manager ~/.local/bin/ci
+
+# Setup PATH
+if ! grep -q "CI Package Manager" ~/.bashrc 2>/dev/null; then
+    echo "" >> ~/.bashrc
+    echo "# CI Package Manager" >> ~/.bashrc
+    echo 'export PATH="$HOME/.local/bin:$HOME/.ci/bin:$PATH"' >> ~/.bashrc
+fi
+
+# Add to current session
+export PATH="$HOME/.local/bin:$HOME/.ci/bin:$PATH"
+
+echo ""
+echo "🎉 PRODUCTION CI PACKAGE MANAGER INSTALLED!"
+echo "=========================================="
+echo ""
+echo "🚀 READY TO USE:"
+echo "  ci install <package>    # Install from $ORG"
+echo "  ci list                # List installed"
+echo "  ci search              # Find packages"
+echo "  <package-name>         # Run installed tool"
+echo ""
+echo "💡 Test it: ci --help"
+EOF
+
+chmod +x install-ci
+./install-ci
+
+## 2. **CREATE TEST PACKAGE IN AMERIGOINC**
+
+Create a repository called `hello-ci` in amerigoinc with:
+
+**spec.ci:**
+```json
+{
+  "name": "hello-ci",
+  "version": "1.0.0",
+  "description": "Simple hello world package",
+  "app_name": "hello-ci",
+  "main_file": "main.py"
+}
